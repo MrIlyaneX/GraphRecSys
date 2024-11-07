@@ -1,0 +1,8 @@
+numpy==1.26.4
+torch-geometric==2.6.1
+torch==2.2.2
+networkx==3.4.2
+matplotlib==3.9.2
+jupyter==1.1.1
+pandas==2.2.3
+scipy==1.14.1
