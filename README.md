@@ -1,5 +1,15 @@
 # Recomendational System using Graph Neural Networks with Pytorch Geometric for DSKReG implementation
 
+## Creators
+
+### Ilia Mistiurin, i.mistiurin@innopolis.university
+
+### Mintimer Karimov, m.karimov@innopolis.university
+
+### Arthur Gubaidullin, a.gubaidullin@innopolis.university
+
+(Duplication for easy finding the notebook) You can see our code in [this jupyter notebook](link)
+
 ## Table of Contents
 
 - [Introduction](#introduction)
@@ -13,6 +23,7 @@
   - [Preference Aware Aggregation](#preference-aware-aggregation)
   - [Creating Loss](#creating-loss)
   - [Model Training](#model-training)
+- [Results](#results)
 
 ## Introduction
 
@@ -47,11 +58,12 @@ Dataset has following usefull information:
 
 Import all needed packages and read the dataset:
 
+```cmd
+pip install numpy, torch, torch-geometric, torch-scatter, networkx, matplotlib, jupyter, pandas, scipy
+```
+
 ```python
 import torch_geometric
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader, LinkNeighborLoader
-import torch_geometric.transforms as T
 import torch
 
 import networkx as nx
@@ -59,7 +71,6 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import pickle
 
 # Load dataset
 anime = pd.read_csv("../data/anime.csv")
@@ -120,7 +131,7 @@ Now our graph is in following format:
 
 ### Graph Convolutions
 
-...
+Graph Convolution is an operation used in Graph Neural Networks (GNNs) to process and analyze graph-structured data. It generalizes the concept of convolution in image processing to graphs. The key idea is to aggregate information from a node’s neighbors and itself to update the node’s representation. Developrt states the depth of convolution: in dense graphs even the depth of 3 might traverse whole graph, wile in spare once it could be needed in order highr, like depth of 10, so it highly dependent of the graph structure.
 
 ### Idea behind Relational Neighborhood Construction
 
@@ -148,16 +159,96 @@ DSKReG has a way to close the first issue, by interconnecting Anime/Item nodes t
 
 With one problem solved, we gain new issue: the number of edges increased (for our case it's approximatly in quadratic way), therefore it become harder to process graph. The increase in edges highly depend on the Item-Entity initial relation of second-order neighbors for one entity: we have about 11k Anime nodes with only ~50 Entity nodes, so for our case increase is significant: we got about 40 million edges.
 
-- For simplicity we will cut anime-titles with member's number less than $100$.
-- We use straightforward preprocessing (it could be optimised with saving some data on local drive during computations, and possibly some increase comes from NetworkX's gigantic graph)
+- For simplicity we will cut anime-titles with member's number less than $500000$.
+- We use straightforward preprocessing (it could be optimised with saving some data on local drive during computations)
 
 ### Implementation
 
 Here is our straightforward implementation of Relational Neighborhood Construction
 
-### PyG Dataset Construction
+```python
+def relational_neighborhood_construction(graph: nx.Graph):
+    users = [node for node in graph.nodes if node.startswith("user")]
+    anime = [node for node in graph.nodes if node.startswith("anime")]
+    types = [node for node in graph.nodes if node.startswith("type")]
+    genre = [node for node in graph.nodes if node.startswith("genre")]
 
-Now we finished with intial dataset preparation, so we can preprocess all the features into edge indexes for our PyG Dataset.
+    # Map indeces
+    mp = {j: i for i, j in mp.items()}
+    anime2idx = {j: i for i, j in enumerate(anime)}
+    users2idx = {j: len(anime2idx) + i for i, j in enumerate(users)}
+    mapping = {mp[int(i[6:])]: j for i, j in anime2idx.items()}
+
+
+    data = HeteroData()
+    data["user"].node_id = torch.tensor(list(users2idx.values()))
+    data["anime"].node_id = torch.tensor(list(anime2idx.values()))
+
+    # Adding User-Anime relation
+    edges = set()
+    for user in users:
+        for anm in graph.neighbors(user):
+            edges.add((user, anm))
+    data["user", "watched", "anime"].edge_index = torch.tensor(
+        [(users2idx[i], anime2idx[j]) for i, j in edges]
+    ).T
+
+    # Adding Anime-Entity(Genre)
+    edges = set()
+    for gnr in genre:
+        anm = sorted(graph.neighbors(gnr))
+        for i in range(len(anm)):
+            for j in range(i + 1, len(anm)):
+                edges.add((anm[i], anm[j]))
+
+    data["anime", "genre", "anime"].edge_index = torch.tensor(
+        [(anime2idx[i], anime2idx[j]) for i, j in edges]
+    ).T
+
+    # Adding Anime-Entity(Type)
+    edges = set()
+    for tp in types:
+        anm = sorted(graph.neighbors(tp))
+        for i in range(len(anm)):
+            for j in range(i + 1, len(anm)):
+                edges.add((anm[i], anm[j]))
+
+    data["anime", "type", "anime"].edge_index = torch.tensor(
+        [(anime2idx[i], anime2idx[j]) for i, j in edges]
+    ).T
+
+    return data, mapping
+```
+
+Now we constructed HeteroData - which is placeholder for heterogeneous graphs with different node types and their relations.
+The 'data["anime", "genre", "anime"]' created in a way "node type 1" -> "relation" -> "node type 2", for which we could store information about the graph: edge index and any additional data we need to store. 'edge_index' represented in COO format, in another words it is tensor of shape [2, num_edges], representing two arrays, that contain starting and ending nodes in a graph.
+
+### Train Test split
+
+```python
+def train_test_split(data, test_size=0.2):
+    train, test = data.clone(), data.clone()
+    users = [i.item() for i in data["user"].node_id]
+    shuffle(users)
+
+    idx = int(len(users) * test_size)
+    train_idx = {j: i + data["anime"].num_nodes for i, j in enumerate(users[idx:])}
+    test_idx = {j: i + data["anime"].num_nodes for i, j in enumerate(users[:idx])}
+
+    train["user"].node_id = torch.tensor([train_idx[i] for i in users[idx:]])
+    test["user"].node_id = torch.tensor([test_idx[i] for i in users[:idx]])
+    train_edges, test_edges = [], []
+
+    edges = data["user", "watched", "anime"].edge_index.cpu().detach().numpy()
+    for i in range(edges.shape[-1]):
+        if edges[0][i] in train_idx:
+            train_edges.append((train_idx[edges[0][i]], edges[1][i]))
+        else:
+            test_edges.append((test_idx[edges[0][i]], edges[1][i]))
+    train["user", "watched", "anime"].edge_index = torch.tensor(train_edges).T
+    test["user", "watched", "anime"].edge_index = torch.tensor(test_edges).T
+    return train, test
+```
 
 ## DSKReG Model
 
@@ -165,113 +256,69 @@ DSKReG model consist of two main parts: Differentiable Sampling and Preference A
 PyG greatly help us. Let's declare our model:
 
 ```python
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import softmax
-import torch.nn as nn
-import torch_scatter
+from torch_geometric.nn import SAGEConv
+from torch.nn import functional as F
 
 
-class DSKReG(MessagePassing):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_relations: int,
-        num_classes: int,
-        top_k: int = 5,
-    ) -> None:
-        super(DSKReG, self).__init__()
+class DSKReG(torch.nn.Module):
+    def __init__(self, user_num, anime_num, hidden_channels, hidden_layers=2, dropout=0.5):
+        super().__init__()
+        self.user_num = user_num
+        self.anime_num = anime_num
 
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
+        self.dropout = nn.Dropout(dropout)
 
-        self.num_relations = num_relations
-        self.num_classes = num_classes
+        self.watched = nn.ModuleList(
+            [SAGEConv(1, hidden_channels)] + [SAGEConv(hidden_channels, hidden_channels) for _ in
+                                              range(hidden_layers - 1)])
+        self.genre = nn.ModuleList([SAGEConv(hidden_channels, hidden_channels) for _ in range(hidden_layers)])
+        self.tp = nn.ModuleList([SAGEConv(hidden_channels, hidden_channels) for _ in range(hidden_layers)])
 
-        self.top_k = top_k
+        self.user_linear = nn.Linear(hidden_channels, hidden_channels)
+        self.anime_linear = nn.Linear(hidden_channels, hidden_channels)
 
-        self.linear_rel = nn.Linear(hidden_dim * 2, 1, bias=True)
-        self.linear_agg = nn.Linear(hidden_dim, hidden_dim, bias=True)
+    def cat(self, user, anime):
+        return torch.cat((user, anime))
 
-        self.relation_weight = nn.Parameter(torch.randn(hidden_dim))
+    def uncat(self, nodes):
+        return nodes[:-self.anime_num], nodes[-self.anime_num:]
 
-```
+    def forward(self, data):
+        user = data['user'].node_id
+        anime = data['anime'].node_id
 
-MessagePassing is ...
-torch_scatter ...
+        user = torch.ones_like(user)[:, None].float()
+        anime = torch.ones_like(anime)[:, None].float()
 
-### Differentiable Sampling
+        nodes = self.cat(user, anime)
+        for watched, genre, tp in zip(self.watched, self.genre, self.tp):
+            nodes = self.dropout(nodes)
 
-```python
-class DSKReG(MessagePassing):
-    ...
+            nodes = watched(nodes, data['user', 'watched', 'anime'].edge_index)
+            nodes = F.relu(nodes)
 
-    def gumbel_softmax_sampling(self, relevance_score, index):
-        grouped_scores = softmax(relevance_score, index=index)
+            user, anime = self.uncat(nodes)
 
-        # Gumbel noise creation
-        gumbel_noise = (
-            torch.rand_like(grouped_scores).log() - torch.rand_like(grouped_scores).log()
-        )
+            anime = genre(anime, data['anime', 'genre', 'anime'].edge_index)
+            anime = F.relu(anime)
 
-        softmax_logits = torch.softmax(
-            (torch.log(grouped_scores) + gumbel_noise) / self.tau,
-            dim=0
-        )
+            anime = tp(anime, data['anime', 'type', 'anime'].edge_index)
+            anime = F.relu(anime)
 
-        _, top_k_indices = torch.topk(
-            softmax_logits,
-            self.top_k,
-            dim=0,
-            largest=True,
-            sorted=False,
-            out=None
-        )
+            nodes = self.cat(user, anime)
 
-        mask = torch.zeros_like(softmax_logits)
-        mask[top_k_indices] = 1.0
+        user, anime = self.uncat(nodes)
 
-        return mask * softmax_logits
-```
+        user = self.user_linear(user)
+        anime = self.anime_linear(anime)
 
-### Preference Aware Aggregation
+        user_idx = (torch.ones((data['anime'].num_nodes, 1)).int() * torch.arange(data['user'].num_nodes)).T.reshape(-1)
+        anime_idx = (torch.ones((data['user'].num_nodes, 1)).int() * torch.arange(data['anime'].num_nodes)).reshape(-1)
 
-The model will look at User-Anime interactions. It will learn how users interact with anime titles by aggregating information from the items they have interacted with. For example, it a user has watched several anime titles, the model will combine the features of those titles to create a representation of the user in "item-space”
+        user = user[user_idx]
+        anime = anime[anime_idx]
 
-```python
-class DSKReG(MessagePassing):
-    ...
-
-    def rel_scores(self, relation_emb, neighbor_emb):
-        concat_emb = torch.cat([relation_emb, neighbor_emb], dim=-1)
-        return torch.softmax(self.linear_rel(concat_emb).squeeze(-1), dim=0)
-
-    def gumbel_softmax_sampling(self, relevance_score, index):
-        grouped_scores = softmax(relevance_score, index=index)
-
-        # Gumbel noise creation
-        gumbel_noise = (
-            torch.rand_like(grouped_scores).log() - torch.rand_like(grouped_scores).log()
-        )
-
-        softmax_logits = torch.softmax(
-            (torch.log(grouped_scores) + gumbel_noise) / self.tau,
-            dim=0
-        )
-
-        _, top_k_indices = torch.topk(
-            softmax_logits,
-            self.top_k,
-            dim=0,
-            largest=True,
-            sorted=False,
-            out=None
-        )
-
-        mask = torch.zeros_like(softmax_logits)
-        mask[top_k_indices] = 1.0
-
-        return mask * softmax_logits
+        return (user * anime).sum(-1)
 ```
 
 ### Creating Loss
@@ -285,22 +332,70 @@ DSKReG uses BPR loss to optimize top-N recommendation, which is defined as follo
 $ \mathcal{L}_{bpr} = \sum_{(u,l,j) \in \mathcal{D}} -\text{log} \sigma \left( \hat{y}(u,l) - \hat{y}(u,j) \right) + \lambda ||\Theta||^{2}\_{2} $
 
 ```python
-class DSKReG(MessagePassing):
-    ...
-    def loss(self, user_emb, pos_item_emb, neg_item_emb, reg_lambda=0.001):
-        pos_scores = (user_emb * pos_item_emb).sum(dim=-1)
-        neg_scores = (user_emb * neg_item_emb).sum(dim=-1)
 
-        bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
-        l2_norm = (
-            user_emb.norm(2).pow(2)
-            + pos_item_emb.norm(2).pow(2)
-            + neg_item_emb.norm(2).pow(2)
-        )
+def loss(self, user_emb, pos_item_emb, neg_item_emb, reg_lambda=0.001):
+	pos_scores = (user_emb * pos_item_emb).sum(dim=-1)
+	neg_scores = (user_emb * neg_item_emb).sum(dim=-1)
 
-        return bpr_loss + reg_lambda * l2_norm
+	bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
+	
+	l2_norm = (
+		user_emb.norm(2).pow(2)
+		+ pos_item_emb.norm(2).pow(2)
+		+ neg_item_emb.norm(2).pow(2)
+	)
+
+	return bpr_loss + reg_lambda * l2_norm
 ```
 
 For loss calculation during training model gets negative examples, witch are items user $u$ has never interacted with.
 
 ### Model Training
+
+We have quite simple training procidure:
+
+```python
+def accuracy(pred, labels):
+	pred = torch.where(pred > 0, torch.ones_like(pred), torch.zeros_like(pred))
+	return (pred == labels).sum() / len(pred)
+
+model = DSKReG(data["user"].num_nodes, data["anime"].num_nodes, 64, 4)
+loss_fn = nn.BCEWithLogitsLoss()
+optim = torch.optim.Adam(model.parameters())
+best = 1
+  
+for epoch in range(25):
+	print(f"Epoch {epoch + 1}...")
+	model.train()
+	
+	Loss = []
+	for _ in range(5):
+		input = get_data(train)
+		output = all_edges(train)
+		out = model(input)
+		
+		loss = loss_fn(out, output)
+		Loss.append(loss.item())
+		
+		optim.zero_grad()
+		loss.backward()
+		optim.step()
+		
+	print(f"Train loss: {sum(Loss) / len(Loss)}")
+		
+		
+	model.eval()
+	input = get_data(test)
+	output = all_edges(test)
+	out = model(input)
+	loss = loss_fn(out, output)
+	print(f"Test loss: {loss.item()}")
+	
+	print(accuracy(out, output))
+```
+
+## Results
+
+We tried to implement DSKReG approach, but it didn’t worked as we hoped: model approach of Differentiable Sampling turned out quite hard to implement into existing PyG MessagePassing class.
+
+For our used model: our improvised to the issues model learns, but because of Differentiable Sampling non existence (We tried to use similar approach as Graph Sage, since they actually have similar ideas in mind) we faced issue of hard-to-learn model, stopping in some plato.
